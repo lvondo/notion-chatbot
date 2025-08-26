@@ -9,17 +9,18 @@ from openai import OpenAI
 # -------------------------
 # CONFIGURATION
 # -------------------------
-os.environ["NOTION_TOKEN"] = "ntn_c326281611316jTwZVdEvjUsO2c3g2ncfFOMGXzBJRBgNI"
-os.environ["OPENAI_API_KEY"] = "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"
+# Load secrets securely from Streamlit
+notion_token = st.secrets["NOTION_TOKEN"]
+openai_api_key = st.secrets["OPENAI_API_KEY"]
+
+client = OpenAI(api_key=openai_api_key)
+notion = Client(auth=notion_token)
 
 database_ids = [
     "8f31a1a8d6f243719bfcbe99712d140c",
     "c44d53e50fc54a7387e7d40f21850e5f",
     "f8d52321d6cb479d99d62e89a4f72f54"
 ]
-
-client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
-notion = Client(auth=os.environ["NOTION_TOKEN"])
 
 EMBEDDINGS_FILE = "notion_embeddings.pkl"
 
@@ -53,9 +54,9 @@ def build_or_load_embeddings(pages):
     if os.path.exists(EMBEDDINGS_FILE):
         with open(EMBEDDINGS_FILE, "rb") as f:
             cached_pages = pickle.load(f)
-        # Check if we need to embed new pages
         if len(cached_pages) == len(pages):
-            return cached_pages
+            return cached_pages  # All pages already embedded
+
     # Otherwise, create embeddings
     for page in pages:
         response = client.embeddings.create(
@@ -63,6 +64,7 @@ def build_or_load_embeddings(pages):
             input=page["title"]
         )
         page["embedding"] = response.data[0].embedding
+
     with open(EMBEDDINGS_FILE, "wb") as f:
         pickle.dump(pages, f)
     return pages
