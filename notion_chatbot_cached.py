@@ -1,151 +1,170 @@
 import os
-import pickle
-import numpy as np
-import faiss
 import streamlit as st
 from notion_client import Client
 from openai import OpenAI
+import numpy as np
+import faiss
 
-# -------------------------
-# CONFIGURATION
-# -------------------------
-
-# Use Streamlit secrets instead of hardcoding
+# -------------------------------
+# Load secrets from Streamlit
+# -------------------------------
 NOTION_TOKEN = st.secrets["NOTION_TOKEN"]
 OPENAI_API_KEY = st.secrets["OPENAI_API_KEY"]
+DATABASE_IDS = st.secrets["DATABASE_IDS"].split(",")  # comma-separated list
 
-database_ids = [
-    "8f31a1a8d6f243719bfcbe99712d140c",
-    "c44d53e50fc54a7387e7d40f21850e5f",
-    "f8d52321d6cb479d99d62e89a4f72f54"
-]
-
-# Clients
-client = OpenAI(api_key=OPENAI_API_KEY)
+# Initialize clients
 notion = Client(auth=NOTION_TOKEN)
+client = OpenAI(api_key=OPENAI_API_KEY)
 
-EMBEDDINGS_FILE = "notion_embeddings.pkl"
+# -------------------------------
+# Notion helpers
+# -------------------------------
+def get_page_title(page):
+    return (
+        page["properties"]
+        .get("Name", {})
+        .get("title", [{}])[0]
+        .get("text", {})
+        .get("content", "Untitled")
+    )
 
-# -------------------------
-# 1. PULL NOTION PAGES
-# -------------------------
-@st.cache_data(show_spinner=True)
+def get_page_url(page_id):
+    clean_id = page_id.replace("-", "")
+    return f"https://www.notion.so/{clean_id}"
+
+def get_page_content(page_id):
+    """Fetch plain text content of a Notion page"""
+    try:
+        blocks = notion.blocks.children.list(page_id).get("results", [])
+        text_chunks = []
+        for block in blocks:
+            if block["type"] in ["paragraph", "heading_1", "heading_2", "heading_3"]:
+                text_chunks.append(
+                    block[block["type"]]
+                    .get("rich_text", [{}])[0]
+                    .get("text", {})
+                    .get("content", "")
+                )
+        return "\n".join([t for t in text_chunks if t])
+    except Exception as e:
+        st.error(f"❌ Failed to fetch content for {page_id}: {e}")
+        return ""
+
+@st.cache_data(show_spinner="Fetching Notion pages...")
 def get_all_notion_pages(database_ids):
     pages = []
     for db_id in database_ids:
         try:
             response = notion.databases.query(database_id=db_id)
+            results = response.get("results", [])
+            for page in results:
+                pages.append(
+                    {
+                        "id": page["id"],
+                        "title": get_page_title(page),
+                        "url": get_page_url(page["id"]),
+                    }
+                )
         except Exception as e:
-            st.error(f"Failed to query database {db_id}: {e}")
-            continue
-        for page in response.get('results', []):
-            try:
-                title = page['properties']['Name']['title'][0]['text']['content']
-            except (KeyError, IndexError):
-                title = "Untitled"
-            url = page.get('url', '')
-            pages.append({
-                "title": title,
-                "url": url,
-                "database_id": db_id
-            })
+            st.error(f"❌ Failed to query database {db_id}: {e}")
     return pages
 
-notion_pages = get_all_notion_pages(database_ids)
-
-# -------------------------
-# 2. LOAD OR CREATE EMBEDDINGS
-# -------------------------
-@st.cache_data(show_spinner=True)
-def build_or_load_embeddings(pages):
-    if os.path.exists(EMBEDDINGS_FILE):
-        with open(EMBEDDINGS_FILE, "rb") as f:
-            cached_pages = pickle.load(f)
-        if len(cached_pages) == len(pages):
-            return cached_pages
-
-    for page in pages:
-        try:
-            response = client.embeddings.create(
-                model="text-embedding-3-large",
-                input=page["title"]
-            )
-            page["embedding"] = response.data[0].embedding
-        except Exception as e:
-            st.error(f"Failed to create embedding for page {page['title']}: {e}")
-            page["embedding"] = np.zeros(1536, dtype=np.float32)  # fallback embedding
-
-    with open(EMBEDDINGS_FILE, "wb") as f:
-        pickle.dump(pages, f)
-    return pages
-
-notion_pages = build_or_load_embeddings(notion_pages)
-
-# -------------------------
-# 3. BUILD FAISS INDEX
-# -------------------------
-@st.cache_resource(show_spinner=True)
+# -------------------------------
+# Embeddings + FAISS index
+# -------------------------------
+@st.cache_resource(show_spinner="Building FAISS index...")
 def build_faiss_index(pages):
-    embeddings = np.array([page["embedding"] for page in pages]).astype("float32")
+    texts = [page["title"] for page in pages]
+    embeddings = []
+    for text in texts:
+        try:
+            emb = client.embeddings.create(
+                model="text-embedding-3-small", input=text
+            ).data[0].embedding
+            embeddings.append(emb)
+        except Exception as e:
+            st.error(f"❌ Failed to embed '{text}': {e}")
+            embeddings.append([0.0] * 1536)
+
+    embeddings = np.array(embeddings).astype("float32")
     dimension = embeddings.shape[1]
     index = faiss.IndexFlatL2(dimension)
     index.add(embeddings)
-    return index
+    return index, pages
 
-index = build_faiss_index(notion_pages)
+def search_similar_pages(query, index, pages, top_k=3):
+    query_embedding = np.array(
+        client.embeddings.create(model="text-embedding-3-small", input=query).data[0].embedding
+    ).astype("float32").reshape(1, -1)
 
-# -------------------------
-# 4. SEARCH & CHAT FUNCTIONS
-# -------------------------
-def search_similar_pages(query, top_k=3):
-    try:
-        query_embedding = np.array([client.embeddings.create(
-            model="text-embedding-3-large",
-            input=query
-        ).data[0].embedding]).astype("float32")
-    except Exception as e:
-        st.error(f"Failed to generate embedding for query: {e}")
-        return []
+    D, I = index.search(query_embedding, top_k)
+    return [pages[i] for i in I[0]]
 
-    distances, indices = index.search(query_embedding, top_k)
-    return [notion_pages[i] for i in indices[0]]
+# -------------------------------
+# Ask OpenAI with context + footnotes
+# -------------------------------
+def ask_with_context(question, similar_pages):
+    context_texts = []
+    footnotes = []
+    for i, p in enumerate(similar_pages, start=1):
+        content = get_page_content(p["id"])
+        if content:
+            context_texts.append(f"[{i}] {p['title']} ({p['url']})\n{content}")
+            footnotes.append(f"[{i}] [{p['title']}]({p['url']})")
 
-def ask_chat_with_links(question, top_k=3):
-    top_pages = search_similar_pages(question, top_k)
-    context_text = ""
-    for page in top_pages:
-        context_text += f"- [{page['title']}]({page['url']})\n"
+    context = "\n\n".join(context_texts)
+
+    if not context:
+        return "⚠️ No relevant content found in Notion.", []
+
     try:
         response = client.chat.completions.create(
-            model="gpt-3.5-turbo",
+            model="gpt-4o-mini",
             messages=[
-                {"role": "system", "content": "Answer questions using the provided Notion pages."},
-                {"role": "user", "content": f"Context:\n{context_text}\n\nQuestion: {question}"}
-            ]
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a helpful assistant. Use ONLY the provided Notion content as your source. "
+                        "When you use information from a page, cite it inline with its footnote number like [1], [2], etc."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": f"Here is the context:\n\n{context}\n\nQuestion: {question}",
+                },
+            ],
+            temperature=0.2,
         )
-        return response.choices[0].message.content
+        return response.choices[0].message.content, footnotes
     except Exception as e:
-        st.error(f"OpenAI request failed: {e}")
-        return "Sorry, I couldn't get an answer from OpenAI."
+        return f"❌ OpenAI request failed: {e}", []
 
-# -------------------------
-# 5. STREAMLIT UI
-# -------------------------
-st.set_page_config(page_title="Notion Chatbot", layout="wide")
-st.title("📖 Notion Chatbot (Cached & GPT-3.5)")
+# -------------------------------
+# Streamlit UI
+# -------------------------------
+st.title("📖 Notion Chatbot with Sources + Footnotes")
 
-if "chat_history" not in st.session_state:
-    st.session_state.chat_history = []
+st.markdown("Ask me a question, and I’ll answer using your Notion databases — with inline citations and source links.")
 
-user_question = st.text_input("Ask a question about your Notion pages:")
+# Fetch data
+notion_pages = get_all_notion_pages(DATABASE_IDS)
+index, pages = build_faiss_index(notion_pages)
+
+# Input
+user_question = st.text_input("❓ Ask a question")
 
 if user_question:
-    with st.spinner("Fetching answer..."):
-        answer = ask_chat_with_links(user_question)
-        st.session_state.chat_history.append((user_question, answer))
+    similar_pages = search_similar_pages(user_question, index, pages)
+    st.write("🔎 Best matching Notion pages:")
+    for p in similar_pages:
+        st.markdown(f"- [{p['title']}]({p['url']})")
 
-# Display chat history
-for q, a in st.session_state.chat_history:
-    st.markdown(f"**You:** {q}")
-    st.markdown(f"**Bot:** {a}")
-    st.markdown("---")
+    answer, footnotes = ask_with_context(user_question, similar_pages)
+
+    st.subheader("💡 Answer")
+    st.write(answer)
+
+    if footnotes:
+        st.markdown("#### 📚 Sources")
+        for f in footnotes:
+            st.markdown(f"- {f}")
