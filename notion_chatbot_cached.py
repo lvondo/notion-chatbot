@@ -1,3 +1,4 @@
+import os
 import numpy as np
 import faiss
 import streamlit as st
@@ -11,20 +12,17 @@ from openai import OpenAI
 NOTION_TOKEN = st.secrets["notion"]["NOTION_TOKEN"]
 OPENAI_API_KEY = st.secrets["openai"]["OPENAI_API_KEY"]
 
-# Notion database IDs and URLs
-DATABASES = [
-    {
-        "id": st.secrets["databases"]["database_1_id"],
-        "url": st.secrets["databases"]["database_1_url"]
-    },
-    {
-        "id": st.secrets["databases"]["database_2_id"],
-        "url": st.secrets["databases"]["database_2_url"]
-    },
-    {
-        "id": st.secrets["databases"]["database_3_id"],
-        "url": st.secrets["databases"]["database_3_url"]
-    }
+# Databases
+database_ids = [
+    st.secrets["databases"]["database_1_id"],
+    st.secrets["databases"]["database_2_id"],
+    st.secrets["databases"]["database_3_id"]
+]
+
+database_urls = [
+    st.secrets["databases"]["database_1_url"],
+    st.secrets["databases"]["database_2_url"],
+    st.secrets["databases"]["database_3_url"]
 ]
 
 client = OpenAI(api_key=OPENAI_API_KEY)
@@ -36,10 +34,9 @@ EMBEDDINGS_FILE = "notion_embeddings.pkl"
 # 1. PULL NOTION PAGES
 # -------------------------
 @st.cache_data(show_spinner=True)
-def get_all_notion_pages(databases):
+def get_all_notion_pages(database_ids, database_urls):
     pages = []
-    for db in databases:
-        db_id = db["id"]
+    for db_id, db_url in zip(database_ids, database_urls):
         try:
             response = notion.databases.query(database_id=db_id)
         except Exception as e:
@@ -50,7 +47,7 @@ def get_all_notion_pages(databases):
                 title = page['properties']['Name']['title'][0]['text']['content']
             except (KeyError, IndexError):
                 title = "Untitled"
-            url = page['url']
+            url = page.get('url', db_url)
             pages.append({
                 "title": title,
                 "url": url,
@@ -58,7 +55,7 @@ def get_all_notion_pages(databases):
             })
     return pages
 
-notion_pages = get_all_notion_pages(DATABASES)
+notion_pages = get_all_notion_pages(database_ids, database_urls)
 
 # -------------------------
 # 2. LOAD OR CREATE EMBEDDINGS
@@ -67,10 +64,9 @@ def build_or_load_embeddings(pages):
     if os.path.exists(EMBEDDINGS_FILE):
         with open(EMBEDDINGS_FILE, "rb") as f:
             cached_pages = pickle.load(f)
-        # Check if we need to embed new pages
         if len(cached_pages) == len(pages):
             return cached_pages
-    # Otherwise, create embeddings
+
     for page in pages:
         try:
             response = client.embeddings.create(
@@ -79,8 +75,9 @@ def build_or_load_embeddings(pages):
             )
             page["embedding"] = response.data[0].embedding
         except Exception as e:
-            st.error(f"Failed to generate embedding for page '{page['title']}': {e}")
-            page["embedding"] = [0.0] * 1536  # fallback embedding
+            st.error(f"Failed to generate embedding for '{page['title']}': {e}")
+            page["embedding"] = np.zeros(1536).tolist()  # fallback
+
     with open(EMBEDDINGS_FILE, "wb") as f:
         pickle.dump(pages, f)
     return pages
@@ -92,8 +89,6 @@ notion_pages = build_or_load_embeddings(notion_pages)
 # -------------------------
 def build_faiss_index(pages):
     embeddings = np.array([page["embedding"] for page in pages]).astype("float32")
-    if embeddings.size == 0:
-        return None
     dimension = embeddings.shape[1]
     index = faiss.IndexFlatL2(dimension)
     index.add(embeddings)
@@ -105,9 +100,6 @@ index = build_faiss_index(notion_pages)
 # 4. SEARCH & CHAT FUNCTIONS
 # -------------------------
 def search_similar_pages(query, top_k=3):
-    if index is None:
-        st.error("FAISS index is empty.")
-        return []
     try:
         query_embedding = np.array([client.embeddings.create(
             model="text-embedding-3-large",
@@ -121,8 +113,6 @@ def search_similar_pages(query, top_k=3):
 
 def ask_chat_with_links(question, top_k=3):
     top_pages = search_similar_pages(question, top_k)
-    if not top_pages:
-        return "Sorry, I couldn't get an answer from OpenAI."
     context_text = ""
     for page in top_pages:
         context_text += f"- [{page['title']}]({page['url']})\n"
@@ -155,7 +145,6 @@ if user_question:
         answer = ask_chat_with_links(user_question)
         st.session_state.chat_history.append((user_question, answer))
 
-# Display chat history
 for q, a in st.session_state.chat_history:
     st.markdown(f"**You:** {q}")
     st.markdown(f"**Bot:** {a}")
